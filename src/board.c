@@ -143,6 +143,72 @@ static void fillDataFromHeader(unsigned char tableType, void *parsedSmbiosHeader
 	return;
 }
 
+int findUbootInfo(const char *path, PKEAPI_BOARD_INFO pBoardInfo)
+{
+	FILE *fd;
+	int32_t rc = 0;
+
+	if ((fd = fopen(path, "rb")) != NULL) {
+		char regex[KEAPI_MAX_STR];
+		pcre *re;
+		const char *error;
+		int erroffset;
+
+		/*
+		* Format of Firmware version:
+		* U-Boot 2017.03-00078-g5a55701420 (Jan 11 2018 - 15:00:16 +0100)
+		*/
+		snprintf(regex, KEAPI_MAX_STR, "(U-Boot\\s+\\d.*)\\s+\\((\\w+)\\s+(\\d+)\\s+(\\d+).*[\\+\\-]\\d{4}\\)");
+
+		if ((re = pcre_compile(regex, PCRE_NEWLINE_ANYCRLF | PCRE_DOTALL, &error, &erroffset, NULL)) != NULL) {
+			int rd_num = 0;
+			int iter_n = 0;
+			const uint16_t bufsize = 1024;
+			char info[bufsize];
+			int32_t ovector[15];
+			const int16_t bl_area_size = 8192;
+			uint16_t i;
+
+			while ((rd_num = fread(info, 1, bufsize - 1, fd)) > 0) {
+				for (i = 0; i < bufsize; i++) {
+					if (info[i] < 32 || info[i] > 126)
+						info[i] = ' ';
+				}
+				info[bufsize - 1] = '\0';
+
+				if (pcre_exec(re, NULL, info, bufsize, 0, 0, ovector, 15) > 0) {
+					memcpy(pBoardInfo->firmwareVersion, info + ovector[2], ovector[3] - ovector[2]);
+					pBoardInfo->firmwareVersion[ovector[3] - ovector[2]] = '\0';
+
+					struct tm ts;
+					memset(&ts, 0, sizeof(struct tm));
+
+					char day[3], month[3], year[5];
+					memcpy(month, info + ovector[4], ovector[5] - ovector[4]);
+					memcpy(day, info + ovector[6], ovector[7] - ovector[6]);
+					memcpy(year, info + ovector[8], ovector[9] - ovector[8]);
+					month[2] = day[2] = year[4] = '\0';
+					ts.tm_mon = monthLetToDig(month);
+					ts.tm_mday = atoi(day);
+					ts.tm_year = atoi(year) - 1900;
+					pBoardInfo->firmwareDate = timegm(&ts);
+					rc = KEAPI_RET_SUCCESS;
+					break;
+				}
+				if (rd_num == bufsize - 1)
+					fseek(fd, -KEAPI_MAX_STR, SEEK_CUR);
+				if (iter_n++ > bl_area_size) {
+					rc = KEAPI_RET_RETRIEVAL_ERROR;
+					break;
+				}
+			}
+		}
+		fclose(fd);
+	} else
+		return KEAPI_RET_RETRIEVAL_ERROR;
+	return rc;
+}
+
 /*******************************************************************************/
 KEAPI_RETVAL KEApiL_GetBoardInfo(PKEAPI_BOARD_INFO pBoardInfo)
 {
@@ -262,11 +328,10 @@ KEAPI_RETVAL KEApiL_GetBoardInfo(PKEAPI_BOARD_INFO pBoardInfo)
 		}
 
 		if (pBoardInfo->firmwareVersion[0] == '\0' && checkRAccess(UBOOT_VERSION_PATH) != KEAPI_RET_SUCCESS) {
-			FILE *fd;
-			int32_t rc;
 			char *mtd_info;
 			char path[PATH_MAX];
 
+			path[0] = '\0';
 			if (ReadFile("/proc/mtd", &mtd_info) == KEAPI_RET_SUCCESS) {
 				if (GetSubStrRegex(mtd_info, "mtd([0-9]+):.*\"bootloader\"", &str,
 						   REG_EXTENDED | REG_NEWLINE) == KEAPI_RET_SUCCESS) {
@@ -277,57 +342,9 @@ KEAPI_RETVAL KEApiL_GetBoardInfo(PKEAPI_BOARD_INFO pBoardInfo)
 				free(mtd_info);
 			}
 
-			if ((fd = fopen(path, "rb")) != NULL) {
-				uint16_t i, bufsize = 1024;
-				char info[bufsize], regex[KEAPI_MAX_STR];
-				pcre *re;
-				const char *error;
-				int erroffset;
-				int32_t ovector[15];
-
-				/*
-				 * Format of Firmware version:
-				 * U-Boot 2017.03-00078-g5a55701420 (Jan 11 2018 - 15:00:16 +0100)
-				*/
-				snprintf(regex, KEAPI_MAX_STR,
-					 "(U-Boot\\s+\\d.*)\\s+\\((\\w+)\\s+(\\d+)\\s+(\\d+).*[\\+\\-]\\d{4}\\)");
-
-				if ((re = pcre_compile(regex, PCRE_NEWLINE_ANYCRLF | PCRE_DOTALL, &error, &erroffset,
-						       NULL)) != NULL) {
-					int rd_num = 0;
-					while ((rd_num = fread(info, 1, bufsize - 1, fd)) > 0) {
-						for (i = 0; i < bufsize; i++) {
-							if (info[i] < 32 || info[i] > 126)
-								info[i] = ' ';
-						}
-						info[bufsize - 1] = '\0';
-
-						rc = pcre_exec(re, NULL, info, bufsize, 0, 0, ovector, 15);
-						if (rc > 0) {
-							memcpy(pBoardInfo->firmwareVersion, info + ovector[2],
-							       ovector[3] - ovector[2]);
-							pBoardInfo->firmwareVersion[ovector[3] - ovector[2]] = '\0';
-
-							struct tm ts;
-							memset(&ts, 0, sizeof(struct tm));
-
-							char day[3], month[3], year[5];
-							memcpy(month, info + ovector[4], ovector[5] - ovector[4]);
-							memcpy(day, info + ovector[6], ovector[7] - ovector[6]);
-							memcpy(year, info + ovector[8], ovector[9] - ovector[8]);
-							month[2] = day[2] = year[4] = '\0';
-							ts.tm_mon = monthLetToDig(month);
-							ts.tm_mday = atoi(day);
-							ts.tm_year = atoi(year) - 1900;
-							pBoardInfo->firmwareDate = timegm(&ts);
-							break;
-						}
-						if (rd_num == bufsize - 1)
-							fseek(fd, -KEAPI_MAX_STR, SEEK_CUR);
-					}
-					fclose(fd);
-				}
-			}
+			if (findUbootInfo(path, pBoardInfo) != KEAPI_RET_SUCCESS)
+				if (findUbootInfo("/dev/mmcblk0", pBoardInfo) != KEAPI_RET_SUCCESS)
+					findUbootInfo("/dev/mmcblk1", pBoardInfo);
 		}
 
 		if (found)
